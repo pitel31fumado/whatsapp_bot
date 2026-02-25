@@ -24,6 +24,24 @@ async function startBot() {
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({ version, logger, auth: state });
+  // === Pairing Code (solo si NO hay credenciales guardadas) ===
+if (!state.creds?.registered) {
+  const phoneNumber = process.env.PAIR_PHONE; // ej: 34683274488
+  if (phoneNumber) {
+    // espera un momento para que el socket inicialice
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode(phoneNumber);
+        console.log("✅ Pairing code:", code);
+        console.log("Ve a WhatsApp -> Dispositivos vinculados -> Vincular con código");
+      } catch (e) {
+        console.log("❌ No pude generar pairing code:", e?.message || e);
+      }
+    }, 2000);
+  } else {
+    console.log("ℹ️ Setea PAIR_PHONE para generar pairing code (ej: 34683274488).");
+  }
+}
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (u) => {
