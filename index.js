@@ -1,5 +1,9 @@
+// index.js (ESM)
+// Node 18+ recomendado (fetch global).
 import express from "express";
 import pino from "pino";
+import fs from "fs";
+import path from "path";
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
@@ -13,14 +17,14 @@ app.use(express.json({ limit: process.env.JSON_LIMIT || "20mb" }));
 
 const PORT = Number(process.env.PORT || 3000);
 
-// ✅ EN RENDER: pon WA_AUTH_DIR=/var/data/auth
+// ✅ EN RENDER: WA_AUTH_DIR=/var/data/auth (con Persistent Disk)
 const AUTH_DIR = process.env.WA_AUTH_DIR || "/var/data/auth";
 
 const API_TOKEN = process.env.API_TOKEN || "";
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 const SERVICE_NAME = process.env.SERVICE_NAME || "wa-bot";
 
-// --- Frases rotativas para PDFs (50+ variantes) ---
+// --- Frases rotativas para PDFs ---
 const PDF_CAPTIONS = [
   "Se adjunta el pedido.",
   "Adjunto encontrarás el pedido.",
@@ -99,31 +103,14 @@ function buildPdfCaption(userCaption) {
   return uc ? `${base}\n${uc}` : base;
 }
 
-// --- Estado global robusto ---
-let sock = null;
-let isReady = false;
-
-let starting = false;
-let connectAttempts = 0;
-
-let lastConnectedAt = null;
-let lastDisconnectAt = null;
-let lastDisconnectReason = null;
-let lastStatusCode = null;
-
-let offlineAlertSent = false;
-let loggedOutAlertSent = false;
-
 // --- Helpers ---
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 function toJid(phone) {
   const digits = String(phone).replace(/\D/g, "");
   return `${digits}@s.whatsapp.net`;
 }
-
 function assertAuth(req, res) {
   const token = req.header("x-api-token");
   if (!API_TOKEN || token !== API_TOKEN) {
@@ -132,7 +119,6 @@ function assertAuth(req, res) {
   }
   return true;
 }
-
 async function assertReady(res) {
   if (!isReady || !sock) {
     res.status(503).json({
@@ -150,7 +136,6 @@ async function assertReady(res) {
   }
   return true;
 }
-
 async function assertNumberOnWA(jid, res) {
   try {
     const exists = await sock.onWhatsApp(jid);
@@ -165,13 +150,17 @@ async function assertNumberOnWA(jid, res) {
     return false;
   }
 }
-
 function computeBackoffMs(attempt) {
   const base = Math.min(60_000, 1000 * Math.pow(2, Math.min(attempt, 6)));
   const jitter = Math.floor(Math.random() * 700);
   return base + jitter;
 }
 
+/**
+ * Diferencia:
+ * - loggedOut => requiere re-vincular (auth inválido, 401, loggedOut)
+ * - connectionReplaced/conflict => otra conexión tomó la sesión (doble instancia / restart solapado)
+ */
 function classifyDisconnect(statusCode, lastDisconnectError) {
   const reason =
     lastDisconnectError?.output?.payload?.message ||
@@ -179,17 +168,22 @@ function classifyDisconnect(statusCode, lastDisconnectError) {
     "Unknown";
 
   const reasonLower = String(reason).toLowerCase();
+
+  const connectionReplaced =
+    statusCode === DisconnectReason.connectionReplaced ||
+    reasonLower.includes("connection replaced") ||
+    reasonLower.includes("conflict");
+
   const loggedOut =
     statusCode === DisconnectReason.loggedOut ||
     statusCode === 401 ||
-    reasonLower.includes("conflict") ||
     reasonLower.includes("device_removed") ||
     reasonLower.includes("logged out");
 
-  return { loggedOut, reason };
+  return { loggedOut, connectionReplaced, reason };
 }
 
-// --- Discord Alerts ---
+// --- Discord Alerts (opcional) ---
 async function sendDiscordAlert(title, payload = {}, level = "info") {
   const body = {
     username: `${SERVICE_NAME}`,
@@ -203,15 +197,11 @@ async function sendDiscordAlert(title, payload = {}, level = "info") {
           inline: false,
         })),
         timestamp: new Date().toISOString(),
-        // color: se omite (Discord requiere número, no ponemos estilos extra)
       },
     ],
   };
 
-  if (!DISCORD_WEBHOOK_URL) {
-    logger.warn({ title, payload }, "DISCORD_WEBHOOK_URL no configurado (alerta solo en logs)");
-    return;
-  }
+  if (!DISCORD_WEBHOOK_URL) return;
 
   try {
     const r = await fetch(DISCORD_WEBHOOK_URL, {
@@ -228,6 +218,100 @@ async function sendDiscordAlert(title, payload = {}, level = "info") {
   }
 }
 
+// =====================================================
+// 1) LOCK: evita 2 instancias usando el mismo AUTH_DIR
+// =====================================================
+const LOCK_FILE = path.join(AUTH_DIR, ".wa-session.lock");
+const LOCK_TTL_MS = Number(process.env.LOCK_TTL_MS || 2 * 60_000);
+
+function acquireLockOrExit() {
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+  // Si existe lock viejo, intentamos recuperarlo
+  if (fs.existsSync(LOCK_FILE)) {
+    try {
+      const raw = fs.readFileSync(LOCK_FILE, "utf8");
+      const data = JSON.parse(raw || "{}");
+      const age = Date.now() - Number(data?.ts || 0);
+      if (age > LOCK_TTL_MS) {
+        fs.unlinkSync(LOCK_FILE);
+      }
+    } catch {
+      try { fs.unlinkSync(LOCK_FILE); } catch {}
+    }
+  }
+
+  // Crear lock atómico
+  try {
+    const fd = fs.openSync(LOCK_FILE, "wx");
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+    fs.closeSync(fd);
+
+    const cleanup = () => {
+      try { fs.unlinkSync(LOCK_FILE); } catch {}
+    };
+    process.on("exit", cleanup);
+    process.on("SIGINT", () => { cleanup(); process.exit(0); });
+    process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+
+    logger.info({ LOCK_FILE }, "✅ Lock adquirido: una sola instancia activa");
+  } catch (e) {
+    logger.error(
+      { LOCK_FILE, err: e?.message || String(e) },
+      "🚫 Otra instancia/proceso ya usa esta sesión. Saliendo para evitar CONFLICT."
+    );
+    process.exit(1);
+  }
+}
+
+// =====================================================
+// 2) COLA: 1 envío a la vez + delay (anti-carreras)
+// =====================================================
+const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 800);
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 200);
+
+let queueSize = 0;
+let sendChain = Promise.resolve();
+
+function enqueueSend(fn) {
+  if (queueSize >= MAX_QUEUE) {
+    const err = new Error("Queue is full");
+    err.statusCode = 429;
+    throw err;
+  }
+
+  queueSize += 1;
+
+  const job = sendChain
+    .catch(() => {}) // que un fallo no rompa la cadena
+    .then(async () => {
+      await fn();
+      if (SEND_DELAY_MS > 0) await sleep(SEND_DELAY_MS);
+    })
+    .finally(() => {
+      queueSize = Math.max(0, queueSize - 1);
+    });
+
+  sendChain = job;
+  return job;
+}
+
+// --- Estado global robusto ---
+let sock = null;
+let authState = null; // guardamos state para saber si está registrado
+let isReady = false;
+
+let starting = false;
+let connectAttempts = 0;
+
+let lastConnectedAt = null;
+let lastDisconnectAt = null;
+let lastDisconnectReason = null;
+let lastStatusCode = null;
+
+let offlineAlertSent = false;
+let loggedOutAlertSent = false;
+
 // --- Bot: arranque robusto ---
 async function startBot() {
   if (starting) {
@@ -241,6 +325,8 @@ async function startBot() {
     try { sock?.end?.(); } catch {}
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    authState = state;
+
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
@@ -262,28 +348,6 @@ async function startBot() {
         logger.warn({ err: e }, "saveCreds failed");
       }
     });
-
-    // Pairing code SOLO si no está registrado
-    if (!state.creds?.registered) {
-      const phoneNumber = process.env.PAIR_PHONE;
-      if (phoneNumber) {
-        setTimeout(async () => {
-          try {
-            const code = await sock.requestPairingCode(phoneNumber);
-            logger.info({ code }, "✅ Pairing code generado (mira logs)");
-            await sendDiscordAlert("Pairing requerido", {
-              authDir: AUTH_DIR,
-              hint: "Se generó pairing code. Revisa logs para verlo.",
-            });
-          } catch (e) {
-            logger.error({ err: e }, "❌ No pude generar pairing code");
-            await sendDiscordAlert("ERROR pairing code", { error: e?.message || String(e) }, "error");
-          }
-        }, 2000);
-      } else {
-        logger.warn("PAIR_PHONE no seteado; no puedo generar pairing code");
-      }
-    }
 
     sock.ev.on("connection.update", async (u) => {
       const { connection, lastDisconnect } = u;
@@ -309,24 +373,49 @@ async function startBot() {
 
         const statusCode = lastDisconnect?.error?.output?.statusCode ?? null;
         const lastErr = lastDisconnect?.error;
-
         lastStatusCode = statusCode;
 
-        const { loggedOut, reason } = classifyDisconnect(statusCode, lastErr);
+        const { loggedOut, connectionReplaced, reason } = classifyDisconnect(statusCode, lastErr);
         lastDisconnectReason = reason;
 
-        logger.warn({ statusCode, reason, loggedOut }, "Conexión WA cerrada");
+        logger.warn({ statusCode, reason, loggedOut, connectionReplaced }, "Conexión WA cerrada");
 
         if (loggedOut) {
           if (!loggedOutAlertSent) {
             loggedOutAlertSent = true;
-            await sendDiscordAlert("🚨 WA LOGGED OUT / 401 (re-vincular)", {
+            await sendDiscordAlert(
+              "🚨 WA LOGGED OUT / 401 (re-vincular)",
+              {
+                statusCode,
+                reason,
+                authDir: AUTH_DIR,
+                action: "Borra /var/data/auth y vuelve a vincular con /pair",
+              },
+              "error"
+            );
+          }
+          return;
+        }
+
+        if (connectionReplaced) {
+          // Esto suele ser doble instancia / restart solapado en Render.
+          // NO borres auth. Espera más y reintenta.
+          await sendDiscordAlert(
+            "⚠️ WA session replaced (conflict)",
+            {
               statusCode,
               reason,
+              hint:
+                "Normalmente pasa por 2 procesos/instancias tocando el mismo AUTH_DIR (deploy/restart). El LOCK debería evitarlo. Verifica Scale=1.",
               authDir: AUTH_DIR,
-              action: "Borra /var/data/auth y vuelve a vincular",
-            }, "error");
-          }
+            },
+            "warn"
+          );
+
+          connectAttempts += 1;
+          const wait = Math.max(30_000, computeBackoffMs(connectAttempts));
+          await sleep(wait);
+          startBot().catch((e) => logger.error({ err: e }, "startBot retry failed"));
           return;
         }
 
@@ -367,13 +456,17 @@ setInterval(async () => {
 
     if (age > OFFLINE_ALERT_AFTER_MS && !offlineAlertSent && !loggedOutAlertSent) {
       offlineAlertSent = true;
-      await sendDiscordAlert("⚠️ WA offline demasiado tiempo", {
-        offlineMs: age,
-        lastConnectedAt,
-        lastDisconnectAt,
-        lastDisconnectReason,
-        statusCode: lastStatusCode,
-      }, "warn");
+      await sendDiscordAlert(
+        "⚠️ WA offline demasiado tiempo",
+        {
+          offlineMs: age,
+          lastConnectedAt,
+          lastDisconnectAt,
+          lastDisconnectReason,
+          statusCode: lastStatusCode,
+        },
+        "warn"
+      );
     }
   } catch (e) {
     logger.warn({ err: e }, "offline monitor failed");
@@ -388,17 +481,54 @@ app.get("/status", (req, res) => {
     ok: true,
     service: SERVICE_NAME,
     isReady,
+    queueSize,
+    sendDelayMs: SEND_DELAY_MS,
     authDir: AUTH_DIR,
+    lockFile: LOCK_FILE,
     lastConnectedAt,
     lastDisconnectAt,
     lastDisconnectReason,
     lastStatusCode,
+    registered: !!authState?.creds?.registered,
   });
+});
+
+/**
+ * POST /pair  (seguro con x-api-token)
+ * Body: { phone?: "346..." }
+ * - Genera pairing code SOLO si no está registrado todavía.
+ * - Si no mandas phone, usa env PAIR_PHONE.
+ */
+app.post("/pair", async (req, res) => {
+  try {
+    if (!assertAuth(req, res)) return;
+    if (!sock) return res.status(503).json({ ok: false, error: "Socket not initialized yet" });
+
+    const registered = !!authState?.creds?.registered;
+    if (registered) {
+      return res.status(400).json({ ok: false, error: "Already registered" });
+    }
+
+    const phone = req.body?.phone || process.env.PAIR_PHONE;
+    if (!phone) {
+      return res.status(400).json({ ok: false, error: "Missing phone (body.phone o env PAIR_PHONE)" });
+    }
+
+    const code = await sock.requestPairingCode(String(phone).replace(/\D/g, ""));
+    logger.info({ code }, "✅ Pairing code generado");
+    await sendDiscordAlert("Pairing requerido (code generado)", { code, authDir: AUTH_DIR });
+
+    return res.json({ ok: true, code });
+  } catch (e) {
+    logger.error({ err: e }, "Error en /pair");
+    return res.status(500).json({ ok: false, error: e?.message || "Server error" });
+  }
 });
 
 /**
  * POST /send
  * Body: { to: "3468...", text: "hola" }
+ * - Serializado: solo 1 envío a la vez + delay
  */
 app.post("/send", async (req, res) => {
   try {
@@ -411,11 +541,13 @@ app.post("/send", async (req, res) => {
     const jid = toJid(to);
     if (!(await assertNumberOnWA(jid, res))) return;
 
-    const r = await sock.sendMessage(jid, { text: String(text) });
-    return res.json({ ok: true, messageId: r?.key?.id });
+    await enqueueSend(async () => {
+      const r = await sock.sendMessage(jid, { text: String(text) });
+      res.json({ ok: true, messageId: r?.key?.id });
+    });
   } catch (e) {
     logger.error({ err: e }, "Error en /send");
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(e?.statusCode || 500).json({ ok: false, error: e?.message || "Server error" });
   }
 });
 
@@ -423,6 +555,7 @@ app.post("/send", async (req, res) => {
  * POST /send-pdf
  * Body:
  * { to, caption?, filename?, pdfBase64 } o { to, caption?, filename?, pdfUrl }
+ * - Serializado: solo 1 envío a la vez + delay
  */
 app.post("/send-pdf", async (req, res) => {
   try {
@@ -444,16 +577,21 @@ app.post("/send-pdf", async (req, res) => {
         : { url: String(pdfUrl) },
       mimetype: "application/pdf",
       fileName: filename ? String(filename) : "documento.pdf",
-      caption: buildPdfCaption(caption), // ✅ frase rotativa + caption opcional
+      caption: buildPdfCaption(caption),
     };
 
-    const r = await sock.sendMessage(jid, docMsg);
-    return res.json({ ok: true, messageId: r?.key?.id });
+    await enqueueSend(async () => {
+      const r = await sock.sendMessage(jid, docMsg);
+      res.json({ ok: true, messageId: r?.key?.id });
+    });
   } catch (e) {
     logger.error({ err: e }, "Error en /send-pdf");
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(e?.statusCode || 500).json({ ok: false, error: e?.message || "Server error" });
   }
 });
 
 app.listen(PORT, () => logger.info({ PORT }, "HTTP server listening"));
+
+// 🔒 Bloquea múltiples instancias y arranca bot
+acquireLockOrExit();
 startBot().catch((e) => logger.error({ err: e }, "Bot failed to start"));
