@@ -1,5 +1,5 @@
 // index.js (ESM) — Render-friendly, bulletproof
-// ✅ Lock para evitar 2 procesos tocando el mismo AUTH_DIR
+// ✅ Lock con heartbeat (auto-limpia locks “pegados”)
 // ✅ Cola: 1 mensaje a la vez + delay
 // ✅ Warmup tras "open" para evitar 515 al primer envío (syncing)
 // ✅ Retry 1 vez si cae con 515 "restart required" durante send
@@ -33,16 +33,15 @@ const SERVICE_NAME = process.env.SERVICE_NAME || "wa-bot";
 // ===============================
 // Config “anti errores”
 // ===============================
-const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 800); // delay entre envíos
-const MAX_QUEUE = Number(process.env.MAX_QUEUE || 200); // tamaño máximo cola
+const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 800);
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 200);
 
-// Warmup tras conectar (evita 515 en el primer send tras pairing/reconnect)
 const WARMUP_AFTER_OPEN_MS = Number(process.env.WARMUP_AFTER_OPEN_MS || 7000);
 
-// Lock anti-doble instancia
-const LOCK_TTL_MS = Number(process.env.LOCK_TTL_MS || 2 * 60_000);
+// Lock: stale y heartbeat
+const LOCK_TTL_MS = Number(process.env.LOCK_TTL_MS || 90_000); // si no se actualiza en 90s -> stale
+const LOCK_HEARTBEAT_MS = Number(process.env.LOCK_HEARTBEAT_MS || 10_000);
 
-// Alerta offline
 const OFFLINE_ALERT_AFTER_MS = Number(process.env.OFFLINE_ALERT_AFTER_MS || 120_000);
 
 // --- Frases rotativas para PDFs ---
@@ -95,21 +94,6 @@ const PDF_CAPTIONS = [
   "Adjunto el pedido para su seguimiento.",
   "Te adjunto el pedido para su seguimiento.",
   "Se adjunta el pedido para su seguimiento.",
-  "Adjunto el PDF correspondiente al pedido.",
-  "Te adjunto el PDF correspondiente al pedido.",
-  "Se adjunta el PDF correspondiente al pedido.",
-  "Adjunto el pedido en formato PDF.",
-  "Te adjunto el pedido en formato PDF.",
-  "Se adjunta el pedido en formato PDF.",
-  "Adjunto el pedido para proceder.",
-  "Te adjunto el pedido para proceder.",
-  "Se adjunta el pedido para proceder.",
-  "Adjunto el pedido listo para procesar.",
-  "Te adjunto el pedido listo para procesar.",
-  "Se adjunta el pedido listo para procesar.",
-  "Adjunto el pedido para confirmar recepción.",
-  "Te adjunto el pedido para confirmar recepción.",
-  "Se adjunta el pedido para confirmar recepción.",
 ];
 
 let pdfCaptionIndex = Math.floor(Math.random() * PDF_CAPTIONS.length);
@@ -151,7 +135,6 @@ async function assertReady(res) {
     return false;
   }
 
-  // warmup anti-515 tras pairing/reconnect
   const now = Date.now();
   if (now < readyAtTs) {
     res.status(503).json({
@@ -161,7 +144,6 @@ async function assertReady(res) {
     });
     return false;
   }
-
   return true;
 }
 
@@ -208,7 +190,6 @@ function classifyDisconnect(statusCode, lastDisconnectError) {
   return { loggedOut, connectionReplaced, reason };
 }
 
-// Retry de envío si aparece 515 “restart required”
 async function sendWithRetry(fn, retries = 1) {
   try {
     return await fn();
@@ -226,7 +207,7 @@ async function sendWithRetry(fn, retries = 1) {
 }
 
 // --- Discord Alerts (opcional) ---
-async function sendDiscordAlert(title, payload = {}, level = "info") {
+async function sendDiscordAlert(title, payload = {}) {
   const body = {
     username: `${SERVICE_NAME}`,
     embeds: [
@@ -261,39 +242,89 @@ async function sendDiscordAlert(title, payload = {}, level = "info") {
 }
 
 // =====================================================
-// 1) LOCK: evita 2 instancias/procesos tocando el auth
+// 1) LOCK con heartbeat (anti-lock pegado)
 // =====================================================
 const LOCK_FILE = path.join(AUTH_DIR, ".wa-session.lock");
+let lockHeartbeatTimer = null;
+
+function readLock() {
+  try {
+    const raw = fs.readFileSync(LOCK_FILE, "utf8");
+    return JSON.parse(raw || "{}");
+  } catch {
+    return null;
+  }
+}
+
+function isLockStale(lockObj) {
+  const ts = Number(lockObj?.ts || 0);
+  if (!ts) return true;
+  return Date.now() - ts > LOCK_TTL_MS;
+}
+
+function writeLock(ts = Date.now()) {
+  const payload = { pid: process.pid, ts };
+  fs.writeFileSync(LOCK_FILE, JSON.stringify(payload));
+}
+
+function cleanupLock() {
+  try {
+    if (lockHeartbeatTimer) clearInterval(lockHeartbeatTimer);
+  } catch {}
+  lockHeartbeatTimer = null;
+
+  // solo borra si el lock es tuyo
+  try {
+    const cur = readLock();
+    if (cur?.pid === process.pid) {
+      fs.unlinkSync(LOCK_FILE);
+      logger.info("🧹 Lock eliminado");
+    }
+  } catch {}
+}
 
 function acquireLockOrExit() {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
+  // Si existe lock, revisa stale
   if (fs.existsSync(LOCK_FILE)) {
-    try {
-      const raw = fs.readFileSync(LOCK_FILE, "utf8");
-      const data = JSON.parse(raw || "{}");
-      const age = Date.now() - Number(data?.ts || 0);
-      if (age > LOCK_TTL_MS) {
+    const cur = readLock();
+    if (!cur || isLockStale(cur)) {
+      try {
         fs.unlinkSync(LOCK_FILE);
+        logger.warn({ cur }, "⚠️ Lock stale detectado, eliminado");
+      } catch (e) {
+        logger.error({ err: e?.message || String(e) }, "No pude borrar lock stale");
       }
-    } catch {
-      try { fs.unlinkSync(LOCK_FILE); } catch {}
     }
   }
 
+  // Crea lock atómico si no existe
   try {
     const fd = fs.openSync(LOCK_FILE, "wx");
     fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
     fs.closeSync(fd);
 
-    const cleanup = () => {
-      try { fs.unlinkSync(LOCK_FILE); } catch {}
-    };
-    process.on("exit", cleanup);
-    process.on("SIGINT", () => { cleanup(); process.exit(0); });
-    process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+    // Heartbeat: refresca ts (si el lock ya no es tuyo, sales)
+    lockHeartbeatTimer = setInterval(() => {
+      try {
+        const cur = readLock();
+        if (!cur || cur.pid !== process.pid) {
+          logger.error({ cur }, "🚫 Perdí el lock (otro proceso lo tomó). Saliendo.");
+          process.exit(1);
+        }
+        writeLock(Date.now());
+      } catch (e) {
+        logger.warn({ err: e?.message || String(e) }, "lock heartbeat failed");
+      }
+    }, LOCK_HEARTBEAT_MS);
 
-    logger.info({ LOCK_FILE }, "✅ Lock adquirido: una sola instancia activa");
+    const onExit = () => cleanupLock();
+    process.on("exit", onExit);
+    process.on("SIGINT", () => { cleanupLock(); process.exit(0); });
+    process.on("SIGTERM", () => { cleanupLock(); process.exit(0); });
+
+    logger.info({ LOCK_FILE, LOCK_TTL_MS, LOCK_HEARTBEAT_MS }, "✅ Lock adquirido con heartbeat");
   } catch (e) {
     logger.error(
       { LOCK_FILE, err: e?.message || String(e) },
@@ -319,7 +350,7 @@ function enqueueSend(fn) {
   queueSize += 1;
 
   const job = sendChain
-    .catch(() => {}) // que un fallo no rompa la cadena
+    .catch(() => {})
     .then(async () => {
       await fn();
       if (SEND_DELAY_MS > 0) await sleep(SEND_DELAY_MS);
@@ -393,7 +424,6 @@ async function startBot() {
         offlineAlertSent = false;
         loggedOutAlertSent = false;
 
-        // warmup anti-515
         readyAtTs = Date.now() + WARMUP_AFTER_OPEN_MS;
 
         logger.info({ warmupMs: WARMUP_AFTER_OPEN_MS }, "✅ WhatsApp conectado (warmup activo)");
@@ -411,7 +441,6 @@ async function startBot() {
 
         const statusCode = lastDisconnect?.error?.output?.statusCode ?? null;
         const lastErr = lastDisconnect?.error;
-
         lastStatusCode = statusCode;
 
         const { loggedOut, connectionReplaced, reason } = classifyDisconnect(statusCode, lastErr);
@@ -422,32 +451,24 @@ async function startBot() {
         if (loggedOut) {
           if (!loggedOutAlertSent) {
             loggedOutAlertSent = true;
-            await sendDiscordAlert(
-              "🚨 WA LOGGED OUT / 401 (re-vincular)",
-              {
-                statusCode,
-                reason,
-                authDir: AUTH_DIR,
-                action: "Borra AUTH_DIR y vuelve a vincular con /pair",
-              },
-              "error"
-            );
+            await sendDiscordAlert("🚨 WA LOGGED OUT / 401 (re-vincular)", {
+              statusCode,
+              reason,
+              authDir: AUTH_DIR,
+              action: "Borra AUTH_DIR y vuelve a vincular con /pair",
+            });
           }
           return;
         }
 
         if (connectionReplaced) {
-          await sendDiscordAlert(
-            "⚠️ WA session replaced (conflict)",
-            {
-              statusCode,
-              reason,
-              hint:
-                "Suele pasar por 2 procesos/instancias tocando AUTH_DIR (deploy/restart). El LOCK debería evitarlo. Verifica Scale=1 y que el disco no lo use otro servicio.",
-              authDir: AUTH_DIR,
-            },
-            "warn"
-          );
+          await sendDiscordAlert("⚠️ WA session replaced (conflict)", {
+            statusCode,
+            reason,
+            hint:
+              "Suele pasar por 2 procesos/instancias tocando AUTH_DIR (deploy/restart). El lock lo mitiga. Verifica Scale=1 y que el disco no lo use otro servicio.",
+            authDir: AUTH_DIR,
+          });
 
           connectAttempts += 1;
           const wait = Math.max(30_000, computeBackoffMs(connectAttempts));
@@ -467,7 +488,7 @@ async function startBot() {
     sock.ev.on("messages.upsert", () => {});
   } catch (e) {
     logger.error({ err: e }, "startBot failed");
-    await sendDiscordAlert("❌ Bot start FAILED", { error: e?.message || String(e) }, "error");
+    await sendDiscordAlert("❌ Bot start FAILED", { error: e?.message || String(e) });
 
     connectAttempts += 1;
     const wait = computeBackoffMs(connectAttempts);
@@ -490,17 +511,13 @@ setInterval(async () => {
 
     if (age > OFFLINE_ALERT_AFTER_MS && !offlineAlertSent && !loggedOutAlertSent) {
       offlineAlertSent = true;
-      await sendDiscordAlert(
-        "⚠️ WA offline demasiado tiempo",
-        {
-          offlineMs: age,
-          lastConnectedAt,
-          lastDisconnectAt,
-          lastDisconnectReason,
-          statusCode: lastStatusCode,
-        },
-        "warn"
-      );
+      await sendDiscordAlert("⚠️ WA offline demasiado tiempo", {
+        offlineMs: age,
+        lastConnectedAt,
+        lastDisconnectAt,
+        lastDisconnectReason,
+        statusCode: lastStatusCode,
+      });
     }
   } catch (e) {
     logger.warn({ err: e }, "offline monitor failed");
@@ -521,6 +538,8 @@ app.get("/status", (_req, res) => {
     maxQueue: MAX_QUEUE,
     authDir: AUTH_DIR,
     lockFile: LOCK_FILE,
+    lockTtlMs: LOCK_TTL_MS,
+    lockHeartbeatMs: LOCK_HEARTBEAT_MS,
     lastConnectedAt,
     lastDisconnectAt,
     lastDisconnectReason,
@@ -547,9 +566,7 @@ app.post("/pair", async (req, res) => {
 
     const phone = req.body?.phone || process.env.PAIR_PHONE;
     if (!phone) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing phone (body.phone o env PAIR_PHONE)" });
+      return res.status(400).json({ ok: false, error: "Missing phone (body.phone o env PAIR_PHONE)" });
     }
 
     const code = await sock.requestPairingCode(String(phone).replace(/\D/g, ""));
@@ -566,9 +583,6 @@ app.post("/pair", async (req, res) => {
 /**
  * POST /send
  * Body: { to: "3468...", text: "hola" }
- * - Serializado: 1 envío a la vez + delay
- * - Bloqueado durante warmup (anti-515)
- * - Retry 1 vez si 515 / restart required
  */
 app.post("/send", async (req, res) => {
   try {
@@ -595,9 +609,6 @@ app.post("/send", async (req, res) => {
  * POST /send-pdf
  * Body:
  * { to, caption?, filename?, pdfBase64 } o { to, caption?, filename?, pdfUrl }
- * - Serializado: 1 envío a la vez + delay
- * - Bloqueado durante warmup (anti-515)
- * - Retry 1 vez si 515 / restart required
  */
 app.post("/send-pdf", async (req, res) => {
   try {
@@ -614,9 +625,7 @@ app.post("/send-pdf", async (req, res) => {
     if (!(await assertNumberOnWA(jid, res))) return;
 
     const docMsg = {
-      document: pdfBase64
-        ? Buffer.from(String(pdfBase64), "base64")
-        : { url: String(pdfUrl) },
+      document: pdfBase64 ? Buffer.from(String(pdfBase64), "base64") : { url: String(pdfUrl) },
       mimetype: "application/pdf",
       fileName: filename ? String(filename) : "documento.pdf",
       caption: buildPdfCaption(caption),
@@ -634,6 +643,6 @@ app.post("/send-pdf", async (req, res) => {
 
 app.listen(PORT, () => logger.info({ PORT }, "HTTP server listening"));
 
-// 🔒 Bloquea múltiples instancias y arranca bot
+// 🔒 Lock + arranque bot
 acquireLockOrExit();
 startBot().catch((e) => logger.error({ err: e }, "Bot failed to start"));
