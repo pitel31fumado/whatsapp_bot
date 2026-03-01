@@ -1,5 +1,11 @@
-// index.js (ESM)
-// Node 18+ recomendado (fetch global).
+// index.js (ESM) — Render-friendly, bulletproof
+// ✅ Lock para evitar 2 procesos tocando el mismo AUTH_DIR
+// ✅ Cola: 1 mensaje a la vez + delay
+// ✅ Warmup tras "open" para evitar 515 al primer envío (syncing)
+// ✅ Retry 1 vez si cae con 515 "restart required" durante send
+// ✅ Endpoint /pair para emparejar con móvil (pairing code)
+// Node 18+ recomendado (fetch global)
+
 import express from "express";
 import pino from "pino";
 import fs from "fs";
@@ -23,6 +29,21 @@ const AUTH_DIR = process.env.WA_AUTH_DIR || "/var/data/auth";
 const API_TOKEN = process.env.API_TOKEN || "";
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 const SERVICE_NAME = process.env.SERVICE_NAME || "wa-bot";
+
+// ===============================
+// Config “anti errores”
+// ===============================
+const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 800); // delay entre envíos
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 200); // tamaño máximo cola
+
+// Warmup tras conectar (evita 515 en el primer send tras pairing/reconnect)
+const WARMUP_AFTER_OPEN_MS = Number(process.env.WARMUP_AFTER_OPEN_MS || 7000);
+
+// Lock anti-doble instancia
+const LOCK_TTL_MS = Number(process.env.LOCK_TTL_MS || 2 * 60_000);
+
+// Alerta offline
+const OFFLINE_ALERT_AFTER_MS = Number(process.env.OFFLINE_ALERT_AFTER_MS || 120_000);
 
 // --- Frases rotativas para PDFs ---
 const PDF_CAPTIONS = [
@@ -119,23 +140,31 @@ function assertAuth(req, res) {
   }
   return true;
 }
+
 async function assertReady(res) {
-  if (!isReady || !sock) {
+  if (!sock || !isReady) {
     res.status(503).json({
       ok: false,
       error: "WhatsApp not ready",
-      details: {
-        isReady,
-        lastConnectedAt,
-        lastDisconnectAt,
-        lastDisconnectReason,
-        lastStatusCode,
-      },
+      details: { isReady, lastConnectedAt, lastDisconnectAt, lastDisconnectReason, lastStatusCode },
     });
     return false;
   }
+
+  // warmup anti-515 tras pairing/reconnect
+  const now = Date.now();
+  if (now < readyAtTs) {
+    res.status(503).json({
+      ok: false,
+      error: "WhatsApp warming up (syncing)",
+      retryAfterMs: readyAtTs - now,
+    });
+    return false;
+  }
+
   return true;
 }
+
 async function assertNumberOnWA(jid, res) {
   try {
     const exists = await sock.onWhatsApp(jid);
@@ -150,17 +179,13 @@ async function assertNumberOnWA(jid, res) {
     return false;
   }
 }
+
 function computeBackoffMs(attempt) {
   const base = Math.min(60_000, 1000 * Math.pow(2, Math.min(attempt, 6)));
   const jitter = Math.floor(Math.random() * 700);
   return base + jitter;
 }
 
-/**
- * Diferencia:
- * - loggedOut => requiere re-vincular (auth inválido, 401, loggedOut)
- * - connectionReplaced/conflict => otra conexión tomó la sesión (doble instancia / restart solapado)
- */
 function classifyDisconnect(statusCode, lastDisconnectError) {
   const reason =
     lastDisconnectError?.output?.payload?.message ||
@@ -181,6 +206,23 @@ function classifyDisconnect(statusCode, lastDisconnectError) {
     reasonLower.includes("logged out");
 
   return { loggedOut, connectionReplaced, reason };
+}
+
+// Retry de envío si aparece 515 “restart required”
+async function sendWithRetry(fn, retries = 1) {
+  try {
+    return await fn();
+  } catch (e) {
+    const msg = String(e?.message || "").toLowerCase();
+    const status = e?.output?.statusCode || e?.statusCode;
+
+    if (retries > 0 && (status === 515 || msg.includes("restart required"))) {
+      logger.warn({ status, msg }, "send failed with 515/restart-required, retrying once");
+      await sleep(1200);
+      return sendWithRetry(fn, retries - 1);
+    }
+    throw e;
+  }
 }
 
 // --- Discord Alerts (opcional) ---
@@ -219,15 +261,13 @@ async function sendDiscordAlert(title, payload = {}, level = "info") {
 }
 
 // =====================================================
-// 1) LOCK: evita 2 instancias usando el mismo AUTH_DIR
+// 1) LOCK: evita 2 instancias/procesos tocando el auth
 // =====================================================
 const LOCK_FILE = path.join(AUTH_DIR, ".wa-session.lock");
-const LOCK_TTL_MS = Number(process.env.LOCK_TTL_MS || 2 * 60_000);
 
 function acquireLockOrExit() {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-  // Si existe lock viejo, intentamos recuperarlo
   if (fs.existsSync(LOCK_FILE)) {
     try {
       const raw = fs.readFileSync(LOCK_FILE, "utf8");
@@ -241,7 +281,6 @@ function acquireLockOrExit() {
     }
   }
 
-  // Crear lock atómico
   try {
     const fd = fs.openSync(LOCK_FILE, "wx");
     fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
@@ -265,11 +304,8 @@ function acquireLockOrExit() {
 }
 
 // =====================================================
-// 2) COLA: 1 envío a la vez + delay (anti-carreras)
+// 2) COLA: 1 envío a la vez + delay
 // =====================================================
-const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 800);
-const MAX_QUEUE = Number(process.env.MAX_QUEUE || 200);
-
 let queueSize = 0;
 let sendChain = Promise.resolve();
 
@@ -296,10 +332,11 @@ function enqueueSend(fn) {
   return job;
 }
 
-// --- Estado global robusto ---
+// --- Estado global ---
 let sock = null;
-let authState = null; // guardamos state para saber si está registrado
+let authState = null;
 let isReady = false;
+let readyAtTs = 0;
 
 let starting = false;
 let connectAttempts = 0;
@@ -321,7 +358,6 @@ async function startBot() {
   starting = true;
 
   try {
-    // cierra socket anterior si existía
     try { sock?.end?.(); } catch {}
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -333,8 +369,6 @@ async function startBot() {
       version,
       logger,
       auth: state,
-
-      // estabilidad
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
       keepAliveIntervalMs: 25_000,
@@ -359,10 +393,14 @@ async function startBot() {
         offlineAlertSent = false;
         loggedOutAlertSent = false;
 
-        logger.info("✅ WhatsApp conectado y listo");
+        // warmup anti-515
+        readyAtTs = Date.now() + WARMUP_AFTER_OPEN_MS;
+
+        logger.info({ warmupMs: WARMUP_AFTER_OPEN_MS }, "✅ WhatsApp conectado (warmup activo)");
         await sendDiscordAlert("✅ WA conectado", {
           lastConnectedAt,
           authDir: AUTH_DIR,
+          warmupMs: WARMUP_AFTER_OPEN_MS,
         });
         return;
       }
@@ -373,6 +411,7 @@ async function startBot() {
 
         const statusCode = lastDisconnect?.error?.output?.statusCode ?? null;
         const lastErr = lastDisconnect?.error;
+
         lastStatusCode = statusCode;
 
         const { loggedOut, connectionReplaced, reason } = classifyDisconnect(statusCode, lastErr);
@@ -389,7 +428,7 @@ async function startBot() {
                 statusCode,
                 reason,
                 authDir: AUTH_DIR,
-                action: "Borra /var/data/auth y vuelve a vincular con /pair",
+                action: "Borra AUTH_DIR y vuelve a vincular con /pair",
               },
               "error"
             );
@@ -398,15 +437,13 @@ async function startBot() {
         }
 
         if (connectionReplaced) {
-          // Esto suele ser doble instancia / restart solapado en Render.
-          // NO borres auth. Espera más y reintenta.
           await sendDiscordAlert(
             "⚠️ WA session replaced (conflict)",
             {
               statusCode,
               reason,
               hint:
-                "Normalmente pasa por 2 procesos/instancias tocando el mismo AUTH_DIR (deploy/restart). El LOCK debería evitarlo. Verifica Scale=1.",
+                "Suele pasar por 2 procesos/instancias tocando AUTH_DIR (deploy/restart). El LOCK debería evitarlo. Verifica Scale=1 y que el disco no lo use otro servicio.",
               authDir: AUTH_DIR,
             },
             "warn"
@@ -427,7 +464,6 @@ async function startBot() {
       }
     });
 
-    // Evita “silencios” raros
     sock.ev.on("messages.upsert", () => {});
   } catch (e) {
     logger.error({ err: e }, "startBot failed");
@@ -443,8 +479,6 @@ async function startBot() {
 }
 
 // --- Monitor offline ---
-const OFFLINE_ALERT_AFTER_MS = Number(process.env.OFFLINE_ALERT_AFTER_MS || 120_000);
-
 setInterval(async () => {
   try {
     if (isReady) return;
@@ -476,13 +510,15 @@ setInterval(async () => {
 // --- HTTP ---
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-app.get("/status", (req, res) => {
+app.get("/status", (_req, res) => {
   res.json({
     ok: true,
     service: SERVICE_NAME,
     isReady,
+    warmupRemainingMs: Math.max(0, readyAtTs - Date.now()),
     queueSize,
     sendDelayMs: SEND_DELAY_MS,
+    maxQueue: MAX_QUEUE,
     authDir: AUTH_DIR,
     lockFile: LOCK_FILE,
     lastConnectedAt,
@@ -494,9 +530,9 @@ app.get("/status", (req, res) => {
 });
 
 /**
- * POST /pair  (seguro con x-api-token)
+ * POST /pair  (x-api-token requerido)
  * Body: { phone?: "346..." }
- * - Genera pairing code SOLO si no está registrado todavía.
+ * - Genera pairing code SOLO si aún NO está registrado.
  * - Si no mandas phone, usa env PAIR_PHONE.
  */
 app.post("/pair", async (req, res) => {
@@ -511,7 +547,9 @@ app.post("/pair", async (req, res) => {
 
     const phone = req.body?.phone || process.env.PAIR_PHONE;
     if (!phone) {
-      return res.status(400).json({ ok: false, error: "Missing phone (body.phone o env PAIR_PHONE)" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing phone (body.phone o env PAIR_PHONE)" });
     }
 
     const code = await sock.requestPairingCode(String(phone).replace(/\D/g, ""));
@@ -528,7 +566,9 @@ app.post("/pair", async (req, res) => {
 /**
  * POST /send
  * Body: { to: "3468...", text: "hola" }
- * - Serializado: solo 1 envío a la vez + delay
+ * - Serializado: 1 envío a la vez + delay
+ * - Bloqueado durante warmup (anti-515)
+ * - Retry 1 vez si 515 / restart required
  */
 app.post("/send", async (req, res) => {
   try {
@@ -542,7 +582,7 @@ app.post("/send", async (req, res) => {
     if (!(await assertNumberOnWA(jid, res))) return;
 
     await enqueueSend(async () => {
-      const r = await sock.sendMessage(jid, { text: String(text) });
+      const r = await sendWithRetry(() => sock.sendMessage(jid, { text: String(text) }), 1);
       res.json({ ok: true, messageId: r?.key?.id });
     });
   } catch (e) {
@@ -555,7 +595,9 @@ app.post("/send", async (req, res) => {
  * POST /send-pdf
  * Body:
  * { to, caption?, filename?, pdfBase64 } o { to, caption?, filename?, pdfUrl }
- * - Serializado: solo 1 envío a la vez + delay
+ * - Serializado: 1 envío a la vez + delay
+ * - Bloqueado durante warmup (anti-515)
+ * - Retry 1 vez si 515 / restart required
  */
 app.post("/send-pdf", async (req, res) => {
   try {
@@ -581,7 +623,7 @@ app.post("/send-pdf", async (req, res) => {
     };
 
     await enqueueSend(async () => {
-      const r = await sock.sendMessage(jid, docMsg);
+      const r = await sendWithRetry(() => sock.sendMessage(jid, docMsg), 1);
       res.json({ ok: true, messageId: r?.key?.id });
     });
   } catch (e) {
