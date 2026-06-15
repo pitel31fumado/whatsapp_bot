@@ -4,6 +4,7 @@
 // ✅ Warmup tras "open" para evitar 515 al primer envío (syncing)
 // ✅ Retry 1 vez si cae con 515 "restart required" durante send
 // ✅ Endpoint /pair para emparejar con móvil (pairing code)
+// ✅ Permite enviar a números y grupos usando el JID del grupo terminado en @g.us
 // Node 18+ recomendado (fetch global)
 
 import express from "express";
@@ -102,6 +103,7 @@ function nextPdfCaption() {
   pdfCaptionIndex += 1;
   return text;
 }
+
 function buildPdfCaption(userCaption) {
   const base = nextPdfCaption();
   const uc = userCaption ? String(userCaption).trim() : "";
@@ -112,10 +114,33 @@ function buildPdfCaption(userCaption) {
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-function toJid(phone) {
-  const digits = String(phone).replace(/\D/g, "");
-  return `${digits}@s.whatsapp.net`;
+
+/**
+ * Convierte el destino en JID.
+ *
+ * Acepta:
+ * - Número: "34600000000" => "34600000000@s.whatsapp.net"
+ * - JID usuario: "34600000000@s.whatsapp.net"
+ * - Grupo: "120363000000000000@g.us"
+ */
+function toJid(to) {
+  const raw = String(to || "").trim();
+
+  // Grupo de WhatsApp
+  if (raw.endsWith("@g.us")) {
+    return { jid: raw, isGroup: true };
+  }
+
+  // JID directo de usuario
+  if (raw.endsWith("@s.whatsapp.net")) {
+    return { jid: raw, isGroup: false };
+  }
+
+  // Número normal
+  const digits = raw.replace(/\D/g, "");
+  return { jid: `${digits}@s.whatsapp.net`, isGroup: false };
 }
+
 function assertAuth(req, res) {
   const token = req.header("x-api-token");
   if (!API_TOKEN || token !== API_TOKEN) {
@@ -144,6 +169,7 @@ async function assertReady(res) {
     });
     return false;
   }
+
   return true;
 }
 
@@ -160,6 +186,31 @@ async function assertNumberOnWA(jid, res) {
     res.status(502).json({ ok: false, error: "WhatsApp lookup failed" });
     return false;
   }
+}
+
+/**
+ * Valida el destino.
+ * - Si es grupo, comprueba que el bot puede leer metadatos del grupo.
+ * - Si es número, usa la validación normal onWhatsApp.
+ */
+async function assertTargetValid(target, res) {
+  const { jid, isGroup } = target;
+
+  if (isGroup) {
+    try {
+      await sock.groupMetadata(jid);
+      return true;
+    } catch (e) {
+      logger.warn({ err: e, jid }, "Group lookup failed");
+      res.status(400).json({
+        ok: false,
+        error: "Group not found or bot is not in this group",
+      });
+      return false;
+    }
+  }
+
+  return assertNumberOnWA(jid, res);
 }
 
 function computeBackoffMs(attempt) {
@@ -202,6 +253,7 @@ async function sendWithRetry(fn, retries = 1) {
       await sleep(1200);
       return sendWithRetry(fn, retries - 1);
     }
+
     throw e;
   }
 }
@@ -232,6 +284,7 @@ async function sendDiscordAlert(title, payload = {}) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
+
     if (!r.ok) {
       const t = await r.text().catch(() => "");
       logger.warn({ status: r.status, text: t }, "Discord webhook non-OK");
@@ -271,6 +324,7 @@ function cleanupLock() {
   try {
     if (lockHeartbeatTimer) clearInterval(lockHeartbeatTimer);
   } catch {}
+
   lockHeartbeatTimer = null;
 
   // solo borra si el lock es tuyo
@@ -313,6 +367,7 @@ function acquireLockOrExit() {
           logger.error({ cur }, "🚫 Perdí el lock (otro proceso lo tomó). Saliendo.");
           process.exit(1);
         }
+
         writeLock(Date.now());
       } catch (e) {
         logger.warn({ err: e?.message || String(e) }, "lock heartbeat failed");
@@ -320,9 +375,16 @@ function acquireLockOrExit() {
     }, LOCK_HEARTBEAT_MS);
 
     const onExit = () => cleanupLock();
+
     process.on("exit", onExit);
-    process.on("SIGINT", () => { cleanupLock(); process.exit(0); });
-    process.on("SIGTERM", () => { cleanupLock(); process.exit(0); });
+    process.on("SIGINT", () => {
+      cleanupLock();
+      process.exit(0);
+    });
+    process.on("SIGTERM", () => {
+      cleanupLock();
+      process.exit(0);
+    });
 
     logger.info({ LOCK_FILE, LOCK_TTL_MS, LOCK_HEARTBEAT_MS }, "✅ Lock adquirido con heartbeat");
   } catch (e) {
@@ -386,10 +448,13 @@ async function startBot() {
     logger.info("startBot ignored: already starting");
     return;
   }
+
   starting = true;
 
   try {
-    try { sock?.end?.(); } catch {}
+    try {
+      sock?.end?.();
+    } catch {}
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     authState = state;
@@ -458,6 +523,7 @@ async function startBot() {
               action: "Borra AUTH_DIR y vuelve a vincular con /pair",
             });
           }
+
           return;
         }
 
@@ -582,7 +648,11 @@ app.post("/pair", async (req, res) => {
 
 /**
  * POST /send
- * Body: { to: "3468...", text: "hola" }
+ * Body para número:
+ * { to: "3468...", text: "hola" }
+ *
+ * Body para grupo:
+ * { to: "120363000000000000@g.us", text: "hola grupo" }
  */
 app.post("/send", async (req, res) => {
   try {
@@ -592,8 +662,10 @@ app.post("/send", async (req, res) => {
     const { to, text } = req.body || {};
     if (!to || !text) return res.status(400).json({ ok: false, error: "Missing to/text" });
 
-    const jid = toJid(to);
-    if (!(await assertNumberOnWA(jid, res))) return;
+    const target = toJid(to);
+    if (!(await assertTargetValid(target, res))) return;
+
+    const jid = target.jid;
 
     await enqueueSend(async () => {
       const r = await sendWithRetry(() => sock.sendMessage(jid, { text: String(text) }), 1);
@@ -607,8 +679,13 @@ app.post("/send", async (req, res) => {
 
 /**
  * POST /send-pdf
- * Body:
+ * Body para número:
  * { to, caption?, filename?, pdfBase64 } o { to, caption?, filename?, pdfUrl }
+ *
+ * Body para grupo:
+ * { to: "120363000000000000@g.us", caption?, filename?, pdfBase64 }
+ * o
+ * { to: "120363000000000000@g.us", caption?, filename?, pdfUrl }
  */
 app.post("/send-pdf", async (req, res) => {
   try {
@@ -617,12 +694,15 @@ app.post("/send-pdf", async (req, res) => {
 
     const { to, caption, filename, pdfBase64, pdfUrl } = req.body || {};
     if (!to) return res.status(400).json({ ok: false, error: "Missing to" });
+
     if (!pdfBase64 && !pdfUrl) {
       return res.status(400).json({ ok: false, error: "Missing pdfBase64 or pdfUrl" });
     }
 
-    const jid = toJid(to);
-    if (!(await assertNumberOnWA(jid, res))) return;
+    const target = toJid(to);
+    if (!(await assertTargetValid(target, res))) return;
+
+    const jid = target.jid;
 
     const docMsg = {
       document: pdfBase64 ? Buffer.from(String(pdfBase64), "base64") : { url: String(pdfUrl) },
